@@ -1,6 +1,6 @@
 # agent-sandbox
 
-Run AI coding agents safely by isolating them with limited GitHub access. The agent can code freely but can only request draft PRs — a watcher service running as your user creates them for your review.
+Run AI coding agents safely in a sandboxed macOS user. The agent gets a **read-only** GitHub PAT — it can clone and commit locally but **cannot push, create PRs, or merge**. When the agent is done, a watcher service pushes the branch and creates a draft PR for your review.
 
 Works with any coding agent: [Claude Code](https://claude.ai/code), [Codex](https://github.com/openai/codex), [Aider](https://aider.chat), [Goose](https://github.com/block/goose), or any CLI tool.
 
@@ -10,57 +10,66 @@ Works with any coding agent: [Claude Code](https://claude.ai/code), [Codex](http
 # 1. Install
 npm install -g agent-sandbox
 
-# 2. Make sure gh CLI is authenticated (used to create draft PRs as you)
+# 2. Make sure gh CLI is authenticated (used to push and create draft PRs)
 gh auth login
 
-# 3. Setup — opens browser to create a GitHub PAT, no sudo needed
-agent-sandbox setup
+# 3. Clone a repo (creates sandbox user if needed, prompts for PAT, adds MCP)
+agent-sandbox clone https://github.com/you/your-repo
 
 # 4. In one terminal, start the PR watcher
 agent-sandbox watch
 
 # 5. In another terminal, run your agent
-agent-sandbox run https://github.com/you/your-repo --agent claude -- --dangerously-skip-permissions
+cd your-repo
+agent-sandbox
 ```
 
-The agent works in the sandbox with a restricted GitHub PAT (can push branches, can't create PRs). When it's done, it calls `create_draft_pr` (via MCP) or `agent-sandbox request` (via CLI). The watcher creates a **draft PR** for you to review.
+That's it. The `clone` command handles all setup — creating the macOS sandbox user, getting a read-only PAT, cloning the repo, and configuring MCP. Running `agent-sandbox` in the repo launches Claude as the sandbox user.
 
-## Architecture
+## How it works
 
 ```
 ┌─────────────────────────────┐     ┌──────────────────────────────┐
-│  sandbox                    │     │  your user                   │
+│  sandbox-agent (macOS user) │     │  your user                   │
 │                             │     │                              │
 │  Any coding agent CLI       │     │  agent-sandbox watch         │
-│  Git PAT: push branches     │────>│  gh CLI (authenticated)      │
-│  No PR creation ability     │ JSON│  Creates DRAFT PRs only      │
-│                             │file │                              │
-│  MCP: create_draft_pr tool  │     │  You review & merge          │
+│  Git PAT: read-only         │────>│  gh CLI (authenticated)      │
+│  Cannot push or create PRs  │ JSON│  Pushes branch               │
+│                             │file │  Creates DRAFT PR            │
+│  Commits locally, then      │     │                              │
+│  requests a draft PR        │     │  You review & merge          │
 └─────────────────────────────┘     └──────────────────────────────┘
 ```
 
-## Setup
-
-Interactive setup walks you through everything — opens your browser to create a GitHub PAT with the right permissions:
-
-```bash
-agent-sandbox setup
-```
-
-You'll need:
-
-- **Agent PAT**: fine-grained token with `Contents: Read and Write` only (setup opens the browser for you)
-- **Your auth**: `gh auth login` so the watcher can create draft PRs
-
-### OS-user isolation (optional)
-
-For stronger isolation, you can create a separate macOS user. This requires sudo:
-
-```bash
-sudo agent-sandbox setup --os-user
-```
+1. `agent-sandbox clone` creates a sandboxed macOS user with a read-only GitHub PAT
+2. `agent-sandbox` runs your coding agent as that user — it can read and commit but not push
+3. The agent calls `create_draft_pr` (via MCP tool, added automatically) when it's done
+4. The watcher (your user, your credentials) pushes the branch and creates a draft PR
+5. You review the draft PR and merge when ready
 
 ## Usage
+
+### Clone a repo
+
+```bash
+agent-sandbox clone https://github.com/owner/repo
+```
+
+First time, this will:
+- Create the `sandbox-agent` macOS user (prompts for sudo)
+- Open your browser to create a read-only GitHub PAT
+- Clone the repo
+- Add `.mcp.json` so the agent gets a `create_draft_pr` tool
+
+### Run an agent
+
+```bash
+cd repo
+agent-sandbox                                            # runs claude (default)
+agent-sandbox --agent codex -- --full-auto               # runs codex
+agent-sandbox --agent aider                              # runs aider
+agent-sandbox -- --dangerously-skip-permissions -p "fix" # pass args to claude
+```
 
 ### Start the PR watcher
 
@@ -72,90 +81,26 @@ agent-sandbox watch
 agent-sandbox watch --install
 ```
 
-### Run a coding agent
-
-```bash
-# Claude Code
-agent-sandbox run https://github.com/owner/repo --agent claude -- --dangerously-skip-permissions
-
-# OpenAI Codex
-agent-sandbox run https://github.com/owner/repo --agent codex -- --full-auto
-
-# Aider
-agent-sandbox run https://github.com/owner/repo --agent aider
-
-# Goose
-agent-sandbox run https://github.com/owner/repo --agent goose
-
-# Any CLI
-agent-sandbox run ./local-repo --agent my-custom-agent
-```
-
-### Agent requests a draft PR
-
-**Option A: MCP server (recommended)**
-
-Add to your agent's MCP config (e.g. `.mcp.json` in the project, or `~/.claude.json`):
-
-```json
-{
-  "mcpServers": {
-    "agent-sandbox": {
-      "command": "agent-sandbox",
-      "args": ["serve"]
-    }
-  }
-}
-```
-
-The agent gets a `create_draft_pr` tool it can call directly — no special instructions needed.
-
-**Option B: CLI**
-
-The agent pushes a branch, then runs:
-
-```bash
-agent-sandbox request \
-  --repo owner/repo \
-  --branch my-feature \
-  --title "Add feature X" \
-  --body "Description of changes"
-```
-
-Either way, the watcher creates a **draft PR** and the agent gets back the URL.
-
-## MCP Tools
-
-When running `agent-sandbox serve`, the following tools are exposed:
-
-| Tool | Description |
-|------|-------------|
-| `create_draft_pr` | Push a branch and request a draft PR. Returns the PR URL. |
-| `get_pr_status` | Check the status of a previously requested PR. |
-
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| `agent-sandbox setup` | Interactive setup (opens browser for PATs) |
-| `agent-sandbox setup --os-user` | Setup with a separate macOS user (requires sudo) |
-| `agent-sandbox watch` | Start the draft PR watcher (foreground) |
+| `agent-sandbox` | Run agent as sandbox user in current dir (default: claude) |
+| `agent-sandbox clone <url>` | Clone repo into sandbox (creates user if needed) |
+| `agent-sandbox watch` | Start the PR watcher (foreground) |
 | `agent-sandbox watch --install` | Install watcher as a background launchd agent |
 | `agent-sandbox watch --uninstall` | Remove the launchd agent |
-| `agent-sandbox run <repo> --agent <cmd>` | Run a coding agent in the sandbox |
 | `agent-sandbox request` | Request a draft PR via CLI |
 | `agent-sandbox serve` | Start the MCP server (stdio) |
 | `agent-sandbox uninstall` | Remove everything |
 
 ## Security model
 
-- The sandbox uses a restricted GitHub PAT that can push branches but **cannot create PRs**
-- All PRs are created as **drafts** requiring your review
-- Git credentials are chmod 600 in `~/.agent-sandbox/git/`
-- PR requests go through a watched directory (`/tmp/agent-sandbox-pr-requests/`)
-- The watcher runs as your user with your GitHub auth
-- The MCP server has no credentials — it only writes request files
-- Optional: `--os-user` creates a separate macOS user for OS-level isolation
+- The agent runs as a **separate macOS user** (`sandbox-agent`) with no access to your credentials
+- The agent's PAT is **read-only** — it cannot push, create PRs, or merge
+- The watcher pushes branches and creates **draft PRs** using your `gh` auth
+- All PRs require your review before merging
+- The MCP server has no credentials — it only writes request files to a watched directory
 
 ## Uninstall
 

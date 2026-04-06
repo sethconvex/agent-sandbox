@@ -1,6 +1,6 @@
 import { parseArgs } from "node:util";
 import { writeFileSync, readFileSync, existsSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { PR_REQUEST_DIR, ensureDir } from "./utils.mjs";
 
 const USAGE = `
@@ -23,9 +23,6 @@ Options:
   -h, --help  Show this help
 `.trim();
 
-// Minimal MCP JSON-RPC server over stdio (no dependencies).
-// Implements just enough of the protocol to expose tools.
-
 function jsonRpcResponse(id, result) {
   return JSON.stringify({ jsonrpc: "2.0", id, result });
 }
@@ -38,18 +35,19 @@ const TOOLS = [
   {
     name: "create_draft_pr",
     description:
-      "Request a draft pull request. The PR is created by the reviewer's GitHub account, not yours. " +
-      "Push your branch first, then call this tool. Returns the draft PR URL.",
+      "Request a draft pull request. Commit your changes to a local branch, then call " +
+      "this tool with the repo path and branch name. The reviewer's watcher service will " +
+      "push the branch and create a draft PR. You do NOT need to push — the watcher handles that.",
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "GitHub repo in owner/repo format" },
-        branch: { type: "string", description: "Branch name to create the PR from (must be pushed already)" },
+        repo_path: { type: "string", description: "Absolute path to the local git repo" },
+        branch: { type: "string", description: "Local branch name with your commits" },
         base: { type: "string", description: "Base branch to merge into (default: main)", default: "main" },
         title: { type: "string", description: "PR title" },
         body: { type: "string", description: "PR description (markdown)", default: "" },
       },
-      required: ["repo", "branch", "title"],
+      required: ["repo_path", "branch", "title"],
     },
   },
   {
@@ -66,10 +64,15 @@ const TOOLS = [
 ];
 
 function handleCreateDraftPr(args) {
-  const { repo, branch, base = "main", title, body = "" } = args;
+  const { repo_path, branch, base = "main", title, body = "" } = args;
 
-  if (!repo || !branch || !title) {
-    return { content: [{ type: "text", text: "Error: repo, branch, and title are required" }], isError: true };
+  if (!repo_path || !branch || !title) {
+    return { content: [{ type: "text", text: "Error: repo_path, branch, and title are required" }], isError: true };
+  }
+
+  const absPath = resolve(repo_path);
+  if (!existsSync(absPath)) {
+    return { content: [{ type: "text", text: `Error: repo path does not exist: ${absPath}` }], isError: true };
   }
 
   ensureDir(PR_REQUEST_DIR);
@@ -79,7 +82,7 @@ function handleCreateDraftPr(args) {
 
   const request = {
     id,
-    repo,
+    repo_path: absPath,
     branch,
     base,
     title,
@@ -90,9 +93,9 @@ function handleCreateDraftPr(args) {
 
   writeFileSync(requestFile, JSON.stringify(request, null, 2));
 
-  // Wait for result (up to 60 seconds)
+  // Wait for result (up to 120 seconds — push + PR creation can take a moment)
   const resultFile = join(PR_REQUEST_DIR, `${id}.result`);
-  const deadline = Date.now() + 60_000;
+  const deadline = Date.now() + 120_000;
 
   return new Promise((resolve) => {
     const check = () => {
@@ -175,7 +178,7 @@ async function handleMessage(msg) {
       });
 
     case "notifications/initialized":
-      return null; // no response needed for notifications
+      return null;
 
     case "tools/list":
       return jsonRpcResponse(id, { tools: TOOLS });
@@ -210,28 +213,23 @@ export async function serve(argv) {
     return;
   }
 
-  // stderr for logging (stdout is the JSON-RPC channel)
   console.error("[agent-sandbox] MCP server starting on stdio...");
 
   ensureDir(PR_REQUEST_DIR);
 
-  // Read JSON-RPC messages from stdin, line-delimited
   let buffer = "";
 
   process.stdin.setEncoding("utf8");
   process.stdin.on("data", async (chunk) => {
     buffer += chunk;
 
-    // MCP uses Content-Length framed messages
     while (buffer.length > 0) {
-      // Try to parse Content-Length header
       const headerEnd = buffer.indexOf("\r\n\r\n");
       if (headerEnd === -1) break;
 
       const header = buffer.slice(0, headerEnd);
       const match = header.match(/Content-Length:\s*(\d+)/i);
       if (!match) {
-        // Not a valid header, try to find the next one
         buffer = buffer.slice(headerEnd + 4);
         continue;
       }
@@ -239,7 +237,7 @@ export async function serve(argv) {
       const contentLength = parseInt(match[1]);
       const bodyStart = headerEnd + 4;
 
-      if (buffer.length < bodyStart + contentLength) break; // need more data
+      if (buffer.length < bodyStart + contentLength) break;
 
       const body = buffer.slice(bodyStart, bodyStart + contentLength);
       buffer = buffer.slice(bodyStart + contentLength);
@@ -265,6 +263,5 @@ export async function serve(argv) {
     process.exit(0);
   });
 
-  // Keep the process alive
   await new Promise(() => {});
 }

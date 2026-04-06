@@ -1,12 +1,14 @@
 import { parseArgs } from "node:util";
-import { readFileSync, writeFileSync, unlinkSync, readdirSync, existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync, unlinkSync, readdirSync, existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { PR_REQUEST_DIR, PLIST_NAME, exec, ensureDir } from "./utils.mjs";
 
 const USAGE = `
-agent-sandbox watch — Watch for PR requests and create draft PRs
+agent-sandbox watch — Watch for PR requests, push branches, and create draft PRs
 
-Runs in the foreground as your user. Uses your 'gh' CLI auth to create draft PRs.
+Runs in the foreground as your user. Uses your 'gh' CLI auth to push the
+agent's local branch and create a draft PR.
 
 Usage:
   agent-sandbox watch [--install]
@@ -17,34 +19,81 @@ Options:
   -h, --help  Show this help
 `.trim();
 
-function createDraftPr(requestFile) {
+function writeResult(path, data) {
+  writeFileSync(path, JSON.stringify(data));
+  // Make world-writable so the sandbox user can clean it up
+  chmodSync(path, 0o666);
+}
+
+function processRequest(requestFile) {
   let request;
   try {
     request = JSON.parse(readFileSync(requestFile, "utf8"));
   } catch (err) {
     console.error(`[${ts()}] Bad request file ${requestFile}: ${err.message}`);
-    unlinkSync(requestFile);
+    try { unlinkSync(requestFile); } catch {}
     return;
   }
 
-  const { id, repo, branch, base = "main", title, body = "" } = request;
-  console.log(`[${ts()}] Processing ${id}: ${repo} ${branch} -> ${base}`);
+  const { id, repo_path, branch, base = "main", title, body = "" } = request;
+  console.log(`[${ts()}] Processing ${id}`);
+  console.log(`  Repo: ${repo_path}`);
+  console.log(`  Branch: ${branch} -> ${base}`);
   console.log(`  Title: ${title}`);
 
   const resultFile = requestFile.replace(".json", ".result");
 
   try {
-    const prUrl = exec(
-      `gh pr create --repo "${repo}" --head "${branch}" --base "${base}" --title "${title}" --body "${body}" --draft`
-    );
+    // Determine the remote repo (owner/repo) from git remote
+    const remoteUrl = exec(`git -C "${repo_path}" remote get-url origin`);
+    const match = remoteUrl.match(/github\.com[:/]([^/]+\/[^/.]+)/);
+    if (!match) {
+      throw new Error(`Could not parse GitHub repo from remote URL: ${remoteUrl}`);
+    }
+    const repo = match[1];
+    console.log(`  Remote: ${repo}`);
+
+    // Enforce branch prefix
+    const BRANCH_PREFIX = "sandbox/";
+    let pushBranch = branch;
+    if (!branch.startsWith(BRANCH_PREFIX)) {
+      pushBranch = `sandbox/${request.requested_by || "agent"}/${branch}`;
+      console.log(`  Renaming branch to '${pushBranch}' (enforcing sandbox/ prefix)`);
+      try { exec(`git -C "${repo_path}" -c safe.directory='*' branch -m "${branch}" "${pushBranch}"`); } catch {}
+    }
+
+    // Refuse to push to protected branches
+    const blocked = ["main", "master", "develop", "release"];
+    if (blocked.includes(pushBranch) || !pushBranch.startsWith(BRANCH_PREFIX)) {
+      throw new Error(`Refusing to push to '${pushBranch}'. Only sandbox/* branches are allowed.`);
+    }
+
+    // Push the branch (no --force flags)
+    exec(`git config --global --add safe.directory "${repo_path}"`);
+    console.log(`  Pushing branch '${pushBranch}'...`);
+    exec(`git -C "${repo_path}" -c "credential.helper=!gh auth git-credential" push origin "${pushBranch}"`);
+    console.log(`  Branch pushed.`);
+
+    // Create the draft PR using execFileSync to avoid shell escaping issues
+    const prUrl = execFileSync("gh", [
+      "pr", "create",
+      "--repo", repo,
+      "--head", pushBranch,
+      "--base", base,
+      "--title", title,
+      "--body", body,
+      "--draft",
+    ], { encoding: "utf8", stdio: "pipe" }).trim();
+
     console.log(`  Created draft PR: ${prUrl}`);
-    writeFileSync(resultFile, JSON.stringify({ status: "success", pr_url: prUrl, id }));
+    try { exec(`open "${prUrl}"`); } catch {}
+    writeResult(resultFile, { status: "success", pr_url: prUrl, id });
   } catch (err) {
     console.error(`  Error: ${err.message}`);
-    writeFileSync(resultFile, JSON.stringify({ status: "error", error: err.message, id }));
+    writeResult(resultFile, { status: "error", error: err.message, id });
   }
 
-  unlinkSync(requestFile);
+  try { unlinkSync(requestFile); } catch {}
 }
 
 function ts() {
@@ -55,7 +104,7 @@ function processExisting() {
   if (!existsSync(PR_REQUEST_DIR)) return;
   for (const file of readdirSync(PR_REQUEST_DIR)) {
     if (file.endsWith(".json")) {
-      createDraftPr(join(PR_REQUEST_DIR, file));
+      processRequest(join(PR_REQUEST_DIR, file));
     }
   }
 }
@@ -144,6 +193,7 @@ export async function watch(argv) {
 
   // Foreground mode
   ensureDir(PR_REQUEST_DIR);
+  try { chmodSync(PR_REQUEST_DIR, 0o777); } catch {}
   console.log(`[${ts()}] Watching ${PR_REQUEST_DIR} for PR requests...`);
   console.log("Press Ctrl+C to stop.\n");
 
@@ -151,5 +201,8 @@ export async function watch(argv) {
 
   setInterval(() => {
     processExisting();
-  }, 2000);
+  }, 500);
+
+  // Keep the process alive
+  await new Promise(() => {});
 }
